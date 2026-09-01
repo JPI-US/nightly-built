@@ -1,0 +1,344 @@
+name: Axum nightly build
+
+# Three ways in:
+#   1. schedule            - 22:00 local, DST-correct (see the `gate` job).
+#   2. repository_dispatch - fired by the firmware repo on push to `deployment`
+#                            (see firmware-repo-hook/nightly-dispatch.yml).
+#   3. workflow_dispatch   - manual, with an optional ref override.
+on:
+  schedule:
+    # GitHub cron is UTC and has no DST. Both of these fire; the `gate` job
+    # keeps only the one that is actually 22:00 in NB_BUILD_TZ.
+    - cron: '0 3 * * *'   # 22:00 America/Chicago during CDT
+    - cron: '0 4 * * *'   # 22:00 America/Chicago during CST
+  repository_dispatch:
+    types: [firmware-push]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Firmware ref to build (default: the deployment branch)'
+        required: false
+        type: string
+
+concurrency:
+  group: nightly-build
+  cancel-in-progress: false
+
+env:
+  FIRMWARE_REPO:   ${{ vars.NB_FIRMWARE_REPO || 'JPI-US/Janta_Power' }}
+  FIRMWARE_BRANCH: ${{ vars.NB_FIRMWARE_BRANCH || 'deployment' }}
+  CHIP:            ${{ vars.NB_CHIP || 'esp32s3' }}
+  TARGET:          ${{ vars.NB_RUST_TARGET || 'xtensa-esp32s3-espidf' }}
+  PROFILE:         ${{ vars.NB_CARGO_PROFILE || 'release' }}
+  BIN_NAME:        ${{ vars.NB_BIN_NAME || 'tower' }}
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 22:00-local gate. Without this a single UTC cron drifts an hour twice a
+  # year and "the 10 PM build" silently becomes the 9 PM build.
+  # --------------------------------------------------------------------------
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          BUILD_TZ: ${{ vars.NB_BUILD_TZ || 'America/Chicago' }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          hour=$(TZ="$BUILD_TZ" date +%H)
+          if [ "$hour" = "22" ]; then
+            echo "22:00 in $BUILD_TZ - building."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Local hour is $hour in $BUILD_TZ, not 22 - this is the other DST cron. Skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      verdict:   ${{ steps.result.outputs.verdict }}
+      sha:       ${{ steps.meta.outputs.sha }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+    steps:
+      - name: Checkout firmware (fresh pull)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FIRMWARE_REPO }}
+          ref: ${{ inputs.ref || github.event.client_payload.ref || env.FIRMWARE_BRANCH }}
+          # github.token only works while the firmware repo is public; set the
+          # NB_FIRMWARE_TOKEN secret before making it private again.
+          token: ${{ secrets.NB_FIRMWARE_TOKEN || github.token }}
+          path: firmware
+          # Full history so the daily report can describe the day's commits,
+          # not just HEAD.
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Commit metadata
+        id: meta
+        working-directory: firmware
+        run: |
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "short_sha=$(git rev-parse --short HEAD)"
+            echo "subject=$(git log -1 --pretty=%s)"
+            echo "author=$(git log -1 --pretty=%an)"
+            echo "committed_at=$(git log -1 --pretty=%cI)"
+          } >> "$GITHUB_OUTPUT"
+          # Commits landed since the previous nightly, for the daily report.
+          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          git log --since="$since" --pretty='%h %an %s' > "$RUNNER_TEMP/commits-24h.txt" || true
+          echo "--- commits in the last 24h ---"
+          cat "$RUNNER_TEMP/commits-24h.txt"
+
+      # ------------------------------------------------------------------
+      # Janta_Power will NOT compile from a clean checkout on its own:
+      #   * build.rs bakes .env into constants.rs (gear reduction, soft limits,
+      #     DEVICE_ID, Wi-Fi). Absent, it silently falls back to defaults - so
+      #     you get an image that is WRONG for this tower rather than an error.
+      #   * mqtt.rs include_str!s certs/tower_<DEVICE_ID>-certificate.pem.crt
+      #     and -private.pem.key at COMPILE time, and certs/ is gitignored.
+      # Both come from secrets, and this step fails loudly rather than shipping
+      # a default-configured image.
+      # ------------------------------------------------------------------
+      - name: Materialize build config (.env + AWS IoT certs)
+        id: config
+        working-directory: firmware
+        env:
+          FIRMWARE_DOTENV: ${{ secrets.FIRMWARE_DOTENV }}
+          TOWER_CERT_PEM:  ${{ secrets.TOWER_CERT_PEM }}
+          TOWER_KEY_PEM:   ${{ secrets.TOWER_KEY_PEM }}
+        run: |
+          set -e
+          if [ -z "$FIRMWARE_DOTENV" ]; then
+            echo "::error::Secret FIRMWARE_DOTENV is not set. build.rs bakes .env into constants.rs; without it the image is built with DEFAULT constants (DEVICE_ID=10, GEAR_REDUCTION=1.0, the default SSID) - wrong firmware, not a build error. Refusing to build."
+            exit 1
+          fi
+          printf '%s\n' "$FIRMWARE_DOTENV" > .env
+
+          # Cert filenames derive from DEVICE_ID, so read it back out of .env
+          # rather than keeping a second copy of it in another secret.
+          device_id=$(sed -n 's/^[[:space:]]*DEVICE_ID[[:space:]]*=[[:space:]]*//p' .env | tail -1 | sed 's/[#[:space:]].*$//' | tr -d '\042\047')
+          if [ -z "$device_id" ]; then
+            echo "::error::DEVICE_ID missing from FIRMWARE_DOTENV - the cert filenames derive from it."
+            exit 1
+          fi
+          echo "Building for DEVICE_ID=$device_id"
+          echo "device_id=$device_id" >> "$GITHUB_OUTPUT"
+
+          mkdir -p certs
+          # Amazon's root CA is public material - fetch it instead of storing a secret.
+          curl -fsSL https://www.amazontrust.com/repository/AmazonRootCA1.pem -o certs/AmazonRootCA1.pem
+
+          if [ -z "$TOWER_CERT_PEM" ] || [ -z "$TOWER_KEY_PEM" ]; then
+            echo "::error::Secrets TOWER_CERT_PEM / TOWER_KEY_PEM are not set. mqtt.rs include_str!s certs/tower_ID-certificate.pem.crt and certs/tower_ID-private.pem.key at compile time (ID=$device_id)."
+            exit 1
+          fi
+          printf '%s\n' "$TOWER_CERT_PEM" > "certs/tower_${device_id}-certificate.pem.crt"
+          printf '%s\n' "$TOWER_KEY_PEM"  > "certs/tower_${device_id}-private.pem.key"
+          echo "certs present:"
+          ls -1 certs
+
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          default: true
+          buildtargets: ${{ env.CHIP }}
+          ldproxy: true
+
+      - name: Install espflash
+        run: cargo install espflash --locked --version "^4"
+
+      # ------------------------------------------------------------------
+      # "esp clean" + "cargo clean": a genuinely fresh build every time.
+      # .embuild is where esp-idf-sys vendors and builds ESP-IDF (v5.2.2, per
+      # .cargo/config.toml), so leaving it behind means the ESP-IDF half of the
+      # build is NOT fresh - and that is the half that hides stale-sdkconfig
+      # bugs. .env and certs/ are written above and deliberately survive.
+      # ------------------------------------------------------------------
+      - name: esp clean + cargo clean
+        working-directory: firmware
+        run: |
+          set -x
+          rm -rf .embuild target
+          rm -rf build sdkconfig sdkconfig.old   # idf.py leftovers, if any
+          cargo clean || true
+          test ! -d .embuild && test ! -d target && echo "clean: ok"
+
+      - name: cargo build
+        id: build
+        working-directory: firmware
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          flags=""
+          if [ "$PROFILE" = "release" ]; then flags="--release"; fi
+          cargo build $flags --target "$TARGET" 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Collect compiler diagnostics
+        if: steps.build.outcome == 'failure'
+        env:
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          # Trim to what an analyst actually needs: the errors and their context.
+          {
+            echo "### cargo build FAILED for $FIRMWARE_REPO@$SHORT_SHA"
+            echo "### target=$TARGET profile=$PROFILE"
+            echo
+            grep -nE "^(error|thread .main. panicked)" -A 12 "$RUNNER_TEMP/build.log" | head -400 || true
+            echo
+            echo "### tail of build log"
+            tail -120 "$RUNNER_TEMP/build.log"
+          } > "$RUNNER_TEMP/build-error.txt"
+          cat "$RUNNER_TEMP/build-error.txt"
+
+      # ------------------------------------------------------------------
+      # Flashable image for the installer. `save-image --merge` emits a single
+      # blob containing bootloader + partition table + app, so the installer
+      # writes it at offset 0x0 and needs to know nothing else.
+      # ------------------------------------------------------------------
+      - name: Package flashable image
+        if: steps.build.outcome == 'success'
+        id: package
+        working-directory: firmware
+        run: |
+          set -e
+          outdir="$RUNNER_TEMP/out"
+          mkdir -p "$outdir"
+          # A workspace with more than one binary would otherwise be packaged
+          # arbitrarily - NB_BIN_NAME names the one that is the firmware.
+          if [ -n "$BIN_NAME" ]; then
+            elf="target/$TARGET/$PROFILE/$BIN_NAME"
+          else
+            elf=$(find "target/$TARGET/$PROFILE" -maxdepth 1 -type f -executable ! -name '*.d' ! -name '*.rlib' ! -name '*.so' | sort | head -1)
+          fi
+          if [ -z "$elf" ] || [ ! -f "$elf" ]; then
+            echo "::error::no ELF produced under target/$TARGET/$PROFILE (BIN_NAME='$BIN_NAME')"
+            ls -l "target/$TARGET/$PROFILE" || true
+            exit 1
+          fi
+          name=$(basename "$elf")
+          echo "ELF: $elf"
+          cp "$elf" "$outdir/$name.elf"
+          # partitions.csv is this project's partition table (declared in
+          # [package.metadata.esp-idf]); without it the merged image would get
+          # espflash's default layout instead of the tower's.
+          # If a future esp-idf-sys drops the ESP-IDF app descriptor, add
+          # --ignore-app-descriptor here rather than downgrading espflash.
+          espflash save-image --chip "$CHIP" --partition-table partitions.csv --merge "$elf" "$outdir/$name-merged.bin"
+          espflash save-image --chip "$CHIP" --partition-table partitions.csv "$elf" "$outdir/$name-app.bin"
+          ( cd "$outdir" && sha256sum ./* > SHA256SUMS )
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -l "$outdir"
+
+      - name: Write manifest
+        if: always()
+        env:
+          VERDICT:    ${{ steps.build.outcome == 'success' && 'PASS' || 'FAIL' }}
+          IMAGE_NAME: ${{ steps.package.outputs.name }}
+          REF:        ${{ inputs.ref || github.event.client_payload.ref || env.FIRMWARE_BRANCH }}
+          SHA:        ${{ steps.meta.outputs.sha }}
+          SHORT_SHA:  ${{ steps.meta.outputs.short_sha }}
+          SUBJECT:    ${{ steps.meta.outputs.subject }}
+          AUTHOR:     ${{ steps.meta.outputs.author }}
+          COMMITTED:  ${{ steps.meta.outputs.committed_at }}
+          TRIGGER:    ${{ github.event_name }}
+          RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID:     ${{ github.run_id }}
+          DEVICE_ID:  ${{ steps.config.outputs.device_id }}
+        run: |
+          outdir="$RUNNER_TEMP/out"
+          mkdir -p "$outdir"
+          merged="$outdir/$IMAGE_NAME-merged.bin"
+          if [ -f "$merged" ]; then
+            image_sha=$(sha256sum "$merged" | cut -d' ' -f1)
+            image="$IMAGE_NAME-merged.bin"
+          else
+            image_sha=""
+            image=""
+          fi
+          # Build the JSON with python so a commit subject containing quotes,
+          # backslashes or unicode can't produce a malformed manifest.
+          IMAGE="$image" IMAGE_SHA="$image_sha" BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          python3 - "$outdir/manifest.json" <<'PY'
+          import json, os, sys
+          manifest = {
+              "verdict":        os.environ["VERDICT"],
+              "repo":           os.environ.get("FIRMWARE_REPO", ""),
+              "ref":            os.environ.get("REF", ""),
+              "commit":         os.environ.get("SHA", ""),
+              "short_commit":   os.environ.get("SHORT_SHA", ""),
+              "commit_subject": os.environ.get("SUBJECT", ""),
+              "commit_author":  os.environ.get("AUTHOR", ""),
+              "committed_at":   os.environ.get("COMMITTED", ""),
+              "chip":           os.environ.get("CHIP", ""),
+              "target":         os.environ.get("TARGET", ""),
+              "profile":        os.environ.get("PROFILE", ""),
+              "trigger":        os.environ.get("TRIGGER", ""),
+              "run_id":         os.environ.get("RUN_ID", ""),
+              "run_url":        os.environ.get("RUN_URL", ""),
+              "built_at":       os.environ["BUILT_AT"],
+              "image":          os.environ["IMAGE"],
+              "image_sha256":   os.environ["IMAGE_SHA"],
+              "flash_offset":   "0x0",
+              # The image embeds THIS tower's certs and .env constants - it is
+              # not interchangeable across the fleet.
+              "device_id":      os.environ.get("DEVICE_ID", ""),
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+          PY
+          cp "$RUNNER_TEMP/build.log"        "$outdir/build.log"        2>/dev/null || true
+          cp "$RUNNER_TEMP/build-error.txt"  "$outdir/build-error.txt"  2>/dev/null || true
+          cp "$RUNNER_TEMP/commits-24h.txt"  "$outdir/commits-24h.txt"  2>/dev/null || true
+          cat "$outdir/manifest.json"
+
+      # WARNING: the merged image embeds this tower's AWS IoT private key.
+      # Artifacts of a PUBLIC repo are downloadable by anyone who can see it.
+      # Keep JPI-US/nightly-built private, or do not inject real certs.
+      - name: Upload build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: axum-build-${{ steps.meta.outputs.short_sha }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Opt-in, and off by default for the same reason as above: a rolling
+      # `nightly` release would publish a firmware image containing device
+      # credentials to an unauthenticated URL.
+      - name: Publish rolling nightly release
+        if: steps.build.outcome == 'success' && vars.NB_PUBLISH_RELEASE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Axum nightly (${{ steps.meta.outputs.short_sha }})
+          prerelease: true
+          files: ${{ runner.temp }}/out/*
+
+      - name: Result
+        id: result
+        env:
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            echo "verdict=PASS" >> "$GITHUB_OUTPUT"
+            echo "### PASS - $SHORT_SHA" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+            echo "### FAIL - $SHORT_SHA" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -60 "$RUNNER_TEMP/build-error.txt" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi

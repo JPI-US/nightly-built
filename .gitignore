@@ -1,0 +1,7 @@
+# local agent state / secrets
+.env
+*.log
+state/
+artifacts/
+__pycache__/
+*.pyc

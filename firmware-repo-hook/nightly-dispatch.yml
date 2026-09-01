@@ -1,0 +1,31 @@
+# Drop this file into the FIRMWARE repo as
+#   .github/workflows/nightly-dispatch.yml
+#
+# It is deliberately tiny: the firmware repo's only job is to say "something
+# landed on deployment". All build logic lives in JPI-US/nightly-built, so the
+# build can be changed without touching firmware history.
+#
+# Requires a secret in the firmware repo:
+#   NIGHTLY_DISPATCH_TOKEN - a fine-grained PAT with
+#                            Contents: read-only + Actions: read/write
+#                            scoped to JPI-US/nightly-built.
+name: Trigger nightly build
+
+on:
+  push:
+    branches: [deployment]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify nightly-built
+        env:
+          GH_TOKEN: ${{ secrets.NIGHTLY_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/JPI-US/nightly-built/dispatches \
+            --method POST \
+            --field event_type=firmware-push \
+            --raw-field 'client_payload[ref]=${{ github.sha }}' \
+            --raw-field 'client_payload[branch]=${{ github.ref_name }}' \
+            --raw-field 'client_payload[pusher]=${{ github.actor }}'
