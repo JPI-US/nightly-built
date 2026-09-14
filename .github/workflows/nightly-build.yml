@@ -45,13 +45,28 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     outputs:
-      run: ${{ steps.check.outputs.run }}
+      run:     ${{ steps.check.outputs.run }}
+      devices: ${{ steps.check.outputs.devices }}
     steps:
       - id: check
         env:
-          BUILD_TZ: ${{ vars.NB_BUILD_TZ || 'America/Chicago' }}
-          EVENT: ${{ github.event_name }}
+          BUILD_TZ:    ${{ vars.NB_BUILD_TZ || 'America/Chicago' }}
+          EVENT:       ${{ github.event_name }}
+          ALL_TOWERS:  ${{ vars.NB_TOWERS || '["9000","9001"]' }}
+          PUSH_TOWERS: ${{ vars.NB_PUSH_TOWERS }}
         run: |
+          # Every tower gets built on the nightly. A push only has to answer
+          # "does this still compile", and one tower answers that as well as
+          # two - so NB_PUSH_TOWERS can narrow push-triggered builds and halve
+          # the Actions minutes. Unset, pushes build everything.
+          if [ "$EVENT" = "schedule" ]; then
+            devices="$ALL_TOWERS"
+          else
+            devices="${PUSH_TOWERS:-$ALL_TOWERS}"
+          fi
+          echo "devices=$devices" >> "$GITHUB_OUTPUT"
+          echo "Towers to build: $devices"
+
           if [ "$EVENT" != "schedule" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
@@ -69,10 +84,16 @@ jobs:
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    outputs:
-      verdict:   ${{ steps.result.outputs.verdict }}
-      sha:       ${{ steps.meta.outputs.sha }}
-      short_sha: ${{ steps.meta.outputs.short_sha }}
+    strategy:
+      # One tower failing must not cancel the other's build - they're
+      # independent firmware images that happen to share a commit.
+      fail-fast: false
+      matrix:
+        device: ${{ fromJSON(needs.gate.outputs.devices) }}
+    # Per-tower secrets live in a GitHub Environment named tower-<id>, so
+    # FIRMWARE_DOTENV / TOWER_CERT_PEM / TOWER_KEY_PEM keep identical names in
+    # each and nothing below this line has to know which tower it's building.
+    environment: tower-${{ matrix.device }}
     steps:
       - name: Checkout firmware (fresh pull)
         uses: actions/checkout@v4
@@ -122,6 +143,7 @@ jobs:
           FIRMWARE_DOTENV: ${{ secrets.FIRMWARE_DOTENV }}
           TOWER_CERT_PEM:  ${{ secrets.TOWER_CERT_PEM }}
           TOWER_KEY_PEM:   ${{ secrets.TOWER_KEY_PEM }}
+          MATRIX_DEVICE:   ${{ matrix.device }}
         run: |
           set -e
           if [ -z "$FIRMWARE_DOTENV" ]; then
@@ -135,6 +157,14 @@ jobs:
           device_id=$(sed -n 's/^[[:space:]]*DEVICE_ID[[:space:]]*=[[:space:]]*//p' .env | tail -1 | sed 's/[#[:space:]].*$//' | tr -d '\042\047')
           if [ -z "$device_id" ]; then
             echo "::error::DEVICE_ID missing from FIRMWARE_DOTENV - the cert filenames derive from it."
+            exit 1
+          fi
+          # The environment and the .env inside it must agree. If they don't,
+          # the constants come from one tower and the certs from another - a
+          # build that succeeds and produces firmware that authenticates as the
+          # wrong thing. Cheap check, expensive failure.
+          if [ "$device_id" != "$MATRIX_DEVICE" ]; then
+            echo "::error::Environment tower-$MATRIX_DEVICE holds a FIRMWARE_DOTENV with DEVICE_ID=$device_id. Its secrets belong to a different tower. Refusing to build."
             exit 1
           fi
           echo "Building for DEVICE_ID=$device_id"
@@ -325,7 +355,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: axum-build-${{ steps.meta.outputs.short_sha }}
+          # The agent matches on the -<device> suffix to pick its own tower's
+          # image; it refuses to fall back to another, so this name matters.
+          name: axum-build-${{ steps.meta.outputs.short_sha }}-${{ matrix.device }}
           path: ${{ runner.temp }}/out
           retention-days: 30
           if-no-files-found: warn
@@ -346,13 +378,14 @@ jobs:
         id: result
         env:
           SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+          DEVICE: ${{ matrix.device }}
         run: |
           if [ "${{ steps.build.outcome }}" = "success" ]; then
             echo "verdict=PASS" >> "$GITHUB_OUTPUT"
-            echo "### PASS - $SHORT_SHA" >> "$GITHUB_STEP_SUMMARY"
+            echo "### PASS - tower $DEVICE @ $SHORT_SHA" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
-            echo "### FAIL - $SHORT_SHA" >> "$GITHUB_STEP_SUMMARY"
+            echo "### FAIL - tower $DEVICE @ $SHORT_SHA" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             head -60 "$RUNNER_TEMP/build-error.txt" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
             echo '```' >> "$GITHUB_STEP_SUMMARY"

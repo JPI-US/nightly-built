@@ -67,16 +67,37 @@ have to set one if you are changing it.
 | `NB_RUST_TARGET` | `xtensa-esp32s3-espidf` | from `.cargo/config.toml` |
 | `NB_CARGO_PROFILE` | `release` | |
 | `NB_BIN_NAME` | `tower` | the `[[bin]]` in `Cargo.toml` |
+| `NB_FLASH_SIZE` | `8mb` | must cover `partitions.csv`, which ends at `0x800000` |
+| `NB_TOWERS` | `["9000","9001"]` | towers built on the nightly |
+| `NB_PUSH_TOWERS` | *unset* | narrows push-triggered builds; unset means all |
 | `NB_PUBLISH_RELEASE` | *unset* | see the warning below |
 
-**Secrets — the build cannot succeed without the first three:**
+**Secrets** — `NB_FIRMWARE_TOKEN` is a repository secret (fine-grained PAT,
+`Contents: Read` on `Janta_Power`). The other three are **per-tower** and live in
+GitHub Environments, one per tower, named `tower-9000` and `tower-9001`:
 
-| Secret | Required | Notes |
+| Secret | Scope | Notes |
 | --- | --- | --- |
-| `FIRMWARE_DOTENV` | **yes** | the entire contents of the tower's `.env` |
-| `TOWER_CERT_PEM` | **yes** | contents of `tower_<DEVICE_ID>-certificate.pem.crt` |
-| `TOWER_KEY_PEM` | **yes** | contents of `tower_<DEVICE_ID>-private.pem.key` |
-| `NB_FIRMWARE_TOKEN` | only when private | fine-grained PAT, `Contents: read` on the firmware repo |
+| `FIRMWARE_DOTENV` | environment | that tower's entire `.env` |
+| `TOWER_CERT_PEM` | environment | contents of `tower_<id>-certificate.pem.crt` |
+| `TOWER_KEY_PEM` | environment | contents of `tower_<id>-private.pem.key` |
+| `NB_FIRMWARE_TOKEN` | repository | PAT, `Contents: Read` on the firmware repo |
+
+Identical names in each environment, so the workflow body never has to know which
+tower it's building — `environment: tower-${{ matrix.device }}` selects the set.
+
+The build cross-checks the environment name against the `DEVICE_ID` inside
+`FIRMWARE_DOTENV` and refuses to proceed if they disagree. Crossing them would
+produce firmware carrying one tower's constants and another tower's credentials —
+a build that goes green and then authenticates as the wrong thing.
+
+### Which towers get built
+
+`NB_TOWERS` (default `["9000","9001"]`) is the nightly set. `NB_PUSH_TOWERS`, if
+set, narrows push-triggered builds — a push only has to answer "does it still
+compile", and one tower answers that as well as two. Two clean builds is roughly
+50 minutes; setting `NB_PUSH_TOWERS` to a single tower keeps you comfortably
+inside a 2,000-minute private-repo allowance.
 
 ## Why those secrets are mandatory
 
