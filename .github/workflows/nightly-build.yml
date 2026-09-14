@@ -180,6 +180,19 @@ jobs:
           fi
           printf '%s\n' "$TOWER_CERT_PEM" > "certs/tower_${device_id}-certificate.pem.crt"
           printf '%s\n' "$TOWER_KEY_PEM"  > "certs/tower_${device_id}-private.pem.key"
+
+          # A cert and key that aren't a pair compile perfectly and then fail
+          # the TLS handshake at runtime - on a pole, at night, looking like a
+          # connectivity fault rather than a provisioning mistake. Comparing
+          # public keys costs nothing and catches it here instead.
+          cert_pub=$(openssl x509 -noout -pubkey -in "certs/tower_${device_id}-certificate.pem.crt" 2>/dev/null | openssl md5)
+          key_pub=$(openssl pkey -pubout -in "certs/tower_${device_id}-private.pem.key" 2>/dev/null | openssl md5)
+          if [ -z "$cert_pub" ] || [ "$cert_pub" != "$key_pub" ]; then
+            echo "::error::TOWER_CERT_PEM and TOWER_KEY_PEM in environment tower-$MATRIX_DEVICE are not a matching keypair (or one of them isn't valid PEM). They would compile and then fail the AWS IoT TLS handshake at runtime."
+            exit 1
+          fi
+          echo "cert/key pair verified"
+
           echo "certs present:"
           ls -1 certs
 
