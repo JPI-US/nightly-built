@@ -1,24 +1,33 @@
 name: Axum nightly build
 
-# Three ways in:
-#   1. schedule            - 22:00 local, DST-correct (see the `gate` job).
-#   2. repository_dispatch - fired by the firmware repo on push to `deployment`
-#                            (see firmware-repo-hook/nightly-dispatch.yml).
-#   3. workflow_dispatch   - manual, with an optional ref override.
+# Two ways in:
+#   1. schedule          - once a night at NB_BUILD_HOUR local, and only if the
+#                          watched branch has moved since the last green build.
+#   2. workflow_dispatch - manual, with an optional ref override and a force
+#                          flag that ignores the already-built check.
+#
+# There is deliberately no push trigger. A commit landing at 3pm and a commit
+# landing at 9pm produce the same nightly build, so reacting to each push just
+# spends Actions minutes on work the 10pm run would do anyway.
 on:
   schedule:
-    # GitHub cron is UTC and has no DST. Both of these fire; the `gate` job
-    # keeps only the one that is actually 22:00 in NB_BUILD_TZ.
-    - cron: '0 3 * * *'   # 22:00 America/Chicago during CDT
-    - cron: '0 4 * * *'   # 22:00 America/Chicago during CST
-  repository_dispatch:
-    types: [firmware-push]
+    # GitHub cron is UTC and has no DST, so this covers 22:00 and 23:00 local
+    # in both CDT (UTC-5) and CST (UTC-6). The `gate` job keeps only the firing
+    # that is actually NB_BUILD_HOUR in NB_BUILD_TZ and discards the rest.
+    - cron: '0 3 * * *'   # 22:00 CDT
+    - cron: '0 4 * * *'   # 23:00 CDT / 22:00 CST
+    - cron: '0 5 * * *'   # 23:00 CST
   workflow_dispatch:
     inputs:
       ref:
         description: 'Firmware ref to build (default: the deployment branch)'
         required: false
         type: string
+      force:
+        description: 'Build even if this commit was already built successfully'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: nightly-build
@@ -39,45 +48,80 @@ env:
 
 jobs:
   # --------------------------------------------------------------------------
-  # 22:00-local gate. Without this a single UTC cron drifts an hour twice a
-  # year and "the 10 PM build" silently becomes the 9 PM build.
+  # Decides whether tonight's run does anything at all. Two independent gates:
+  # the right local hour (cron is UTC and has no DST), and whether the watched
+  # branch has actually moved since the last green build.
   # --------------------------------------------------------------------------
   gate:
     runs-on: ubuntu-latest
     outputs:
-      run:     ${{ steps.check.outputs.run }}
-      devices: ${{ steps.check.outputs.devices }}
+      run:     ${{ steps.decide.outputs.run }}
+      devices: ${{ steps.decide.outputs.devices }}
+      sha:     ${{ steps.head.outputs.sha }}
     steps:
-      - id: check
+      - name: Resolve the watched branch's HEAD
+        id: head
         env:
-          BUILD_TZ:    ${{ vars.NB_BUILD_TZ || 'America/Chicago' }}
-          EVENT:       ${{ github.event_name }}
-          ALL_TOWERS:  ${{ vars.NB_TOWERS || '["9000","9001"]' }}
-          PUSH_TOWERS: ${{ vars.NB_PUSH_TOWERS }}
+          TOKEN:  ${{ secrets.NB_FIRMWARE_TOKEN }}
+          REPO:   ${{ env.FIRMWARE_REPO }}
+          BRANCH: ${{ inputs.ref || env.FIRMWARE_BRANCH }}
         run: |
-          # Every tower gets built on the nightly. A push only has to answer
-          # "does this still compile", and one tower answers that as well as
-          # two - so NB_PUSH_TOWERS can narrow push-triggered builds and halve
-          # the Actions minutes. Unset, pushes build everything.
-          if [ "$EVENT" = "schedule" ]; then
-            devices="$ALL_TOWERS"
-          else
-            devices="${PUSH_TOWERS:-$ALL_TOWERS}"
+          # ls-remote rather than a checkout: one round trip, no clone, and
+          # deciding whether to build needs nothing else from the repo.
+          url="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          sha=$(git ls-remote "$url" "$BRANCH" "refs/heads/$BRANCH" | head -1 | cut -f1)
+          if [ -z "$sha" ]; then
+            echo "::error::Could not resolve '$BRANCH' in $REPO. Either the branch doesn't exist or NB_FIRMWARE_TOKEN can't read the repo."
+            exit 1
           fi
-          echo "devices=$devices" >> "$GITHUB_OUTPUT"
-          echo "Towers to build: $devices"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$REPO@$BRANCH is at $sha"
 
-          if [ "$EVENT" != "schedule" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+      # A cache entry keyed by the commit itself. A hit means every tower built
+      # this exact commit and passed - the `record` job only saves the marker
+      # when the whole matrix is green, so a failure leaves no marker and
+      # tomorrow retries instead of skipping a broken commit forever.
+      - name: Has this commit already been built?
+        id: seen
+        uses: actions/cache/restore@v4
+        with:
+          path: .nightly-marker
+          key: built-${{ steps.head.outputs.sha }}
+          lookup-only: true
+
+      - id: decide
+        env:
+          BUILD_TZ:   ${{ vars.NB_BUILD_TZ || 'America/Chicago' }}
+          BUILD_HOUR: ${{ vars.NB_BUILD_HOUR || '22' }}
+          EVENT:      ${{ github.event_name }}
+          FORCE:      ${{ inputs.force }}
+          ALREADY:    ${{ steps.seen.outputs.cache-hit }}
+          DEVICES:    ${{ vars.NB_TOWERS || '["9000","9001"]' }}
+          SHA:        ${{ steps.head.outputs.sha }}
+        run: |
+          echo "devices=$DEVICES" >> "$GITHUB_OUTPUT"
+          skip() { echo "$1"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          # Three of the four scheduled firings are the wrong hour - GitHub
+          # cron is UTC with no DST, so we cover every candidate and discard
+          # here. Without this, "the 10pm build" silently becomes the 9pm
+          # build twice a year.
+          if [ "$EVENT" = "schedule" ]; then
+            hour=$(TZ="$BUILD_TZ" date +%H)
+            if [ "$hour" != "$BUILD_HOUR" ]; then
+              skip "Local hour is $hour in $BUILD_TZ, not $BUILD_HOUR - wrong DST cron. Skipping."
+            fi
+            echo "$BUILD_HOUR:00 in $BUILD_TZ."
           fi
-          hour=$(TZ="$BUILD_TZ" date +%H)
-          if [ "$hour" = "22" ]; then
-            echo "22:00 in $BUILD_TZ - building."
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Local hour is $hour in $BUILD_TZ, not 22 - this is the other DST cron. Skipping."
-            echo "run=false" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "force requested - building $SHA regardless."
+          elif [ "$ALREADY" = "true" ]; then
+            skip "$SHA was already built successfully and the branch hasn't moved. Nothing to do."
           fi
+
+          echo "Towers to build: $DEVICES"
+          echo "run=true" >> "$GITHUB_OUTPUT"
 
   build:
     needs: gate
@@ -99,7 +143,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.FIRMWARE_REPO }}
-          ref: ${{ inputs.ref || github.event.client_payload.ref || env.FIRMWARE_BRANCH }}
+          # The exact SHA the gate resolved, not the branch name - otherwise a
+          # push landing mid-run could build 9000 and 9001 from different commits.
+          ref: ${{ needs.gate.outputs.sha }}
           # github.token only works while the firmware repo is public; set the
           # NB_FIRMWARE_TOKEN secret before making it private again.
           token: ${{ secrets.NB_FIRMWARE_TOKEN || github.token }}
@@ -300,7 +346,7 @@ jobs:
         env:
           VERDICT:    ${{ steps.build.outcome == 'success' && 'PASS' || 'FAIL' }}
           IMAGE_NAME: ${{ steps.package.outputs.name }}
-          REF:        ${{ inputs.ref || github.event.client_payload.ref || env.FIRMWARE_BRANCH }}
+          REF:        ${{ inputs.ref || env.FIRMWARE_BRANCH }}
           SHA:        ${{ steps.meta.outputs.sha }}
           SHORT_SHA:  ${{ steps.meta.outputs.short_sha }}
           SUBJECT:    ${{ steps.meta.outputs.subject }}
@@ -404,3 +450,26 @@ jobs:
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+
+  # --------------------------------------------------------------------------
+  # Remember this commit as built - but only if the WHOLE matrix passed. A
+  # partial failure leaves no marker, so tonight's failure is retried tomorrow
+  # rather than skipped forever as "already built".
+  # --------------------------------------------------------------------------
+  record:
+    needs: [gate, build]
+    if: needs.gate.outputs.run == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          {
+            echo "commit: ${{ needs.gate.outputs.sha }}"
+            echo "towers: ${{ needs.gate.outputs.devices }}"
+            echo "built:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > .nightly-marker
+          cat .nightly-marker
+      - uses: actions/cache/save@v4
+        with:
+          path: .nightly-marker
+          key: built-${{ needs.gate.outputs.sha }}

@@ -1,6 +1,6 @@
 # nightly-built
 
-Nightly (and on-push) firmware builds for **Axum**, feeding the daily progress
+Nightly firmware builds for **Axum**, feeding the daily progress
 reports in [`JPI-US/data-processor-scheduler`](https://github.com/JPI-US/data-processor-scheduler).
 
 Two halves:
@@ -11,9 +11,8 @@ Two halves:
 | **`agent/`** | the Monitor PC (`D:\scheduler`) | watch for results, keep the last good image, flash it, publish into the reports the 11 PM analysis reads |
 
 ```
-push to `deployment` ──┐
-                       ├──► GitHub Actions ──► artifact (manifest.json + merged .bin + build log)
-22:00 local (cron) ────┘                              │
+22:00 local, if `deployment` has moved ──► GitHub Actions ──► artifact per tower
+                                                      │      (manifest.json + merged .bin + build log)
                                                       ▼
                                             agent/build_agent.py  (polls)
                                                       │
@@ -38,13 +37,15 @@ the ESP-IDF half of the build is not actually fresh, and that is precisely the h
 that hides stale-`sdkconfig` problems. `idf.py` leftovers (`build/`, `sdkconfig`,
 `sdkconfig.old`) go too.
 
-The cost is honesty about time: a genuinely clean build is roughly **15–25 minutes**
-on a hosted runner, every time, because ESP-IDF v5.2.2 (pinned in
-`.cargo/config.toml`) is recompiled from scratch, and `[unstable] build-std` rebuilds
-`std` and `panic_abort` with it. That is the intended trade for a nightly. If
-push-triggered builds start feeling too slow, the thing to add is a *separate* fast
-lane with `Swatinem/rust-cache` — not caching on this workflow, which would defeat
-its purpose.
+The cost is time: **~13 minutes per tower**, measured, because ESP-IDF v5.2.2
+(pinned in `.cargo/config.toml`) is recompiled from scratch and `[unstable]
+build-std` rebuilds `std` and `panic_abort` with it. Towers build in parallel, so
+that's also the wall-clock. Once a night, only when the branch has moved, that is
+a trade worth making — and it's the reason there's no push trigger.
+
+If you ever want a fast per-push compile check, add it as a *separate* workflow
+with `Swatinem/rust-cache`. Don't add caching here; it would defeat the point of
+this one.
 
 `.env` and `certs/` are written before the clean and deliberately survive it; only
 `.embuild/`, `target/` and any `idf.py` leftovers are removed.
@@ -62,14 +63,14 @@ have to set one if you are changing it.
 | --- | --- | --- |
 | `NB_FIRMWARE_REPO` | `JPI-US/Janta_Power` | |
 | `NB_FIRMWARE_BRANCH` | `deployment` | |
-| `NB_BUILD_TZ` | `America/Chicago` | the timezone "10 PM" is measured in |
+| `NB_BUILD_TZ` | `America/Chicago` | the timezone the build hour is measured in |
+| `NB_BUILD_HOUR` | `22` | local hour of the nightly; see the note on 23 below |
 | `NB_CHIP` | `esp32s3` | |
 | `NB_RUST_TARGET` | `xtensa-esp32s3-espidf` | from `.cargo/config.toml` |
 | `NB_CARGO_PROFILE` | `release` | |
 | `NB_BIN_NAME` | `tower` | the `[[bin]]` in `Cargo.toml` |
 | `NB_FLASH_SIZE` | `8mb` | must cover `partitions.csv`, which ends at `0x800000` |
 | `NB_TOWERS` | `["9000","9001"]` | towers built on the nightly |
-| `NB_PUSH_TOWERS` | *unset* | narrows push-triggered builds; unset means all |
 | `NB_PUBLISH_RELEASE` | *unset* | see the warning below |
 
 **Secrets** — `NB_FIRMWARE_TOKEN` is a repository secret (fine-grained PAT,
@@ -91,13 +92,18 @@ The build cross-checks the environment name against the `DEVICE_ID` inside
 produce firmware carrying one tower's constants and another tower's credentials —
 a build that goes green and then authenticates as the wrong thing.
 
-### Which towers get built
+### Why 22:00 and not 23:00
 
-`NB_TOWERS` (default `["9000","9001"]`) is the nightly set. `NB_PUSH_TOWERS`, if
-set, narrows push-triggered builds — a push only has to answer "does it still
-compile", and one tower answers that as well as two. Two clean builds is roughly
-50 minutes; setting `NB_PUSH_TOWERS` to a single tower keeps you comfortably
-inside a 2,000-minute private-repo allowance.
+The capture rollover is at 23:00, and a build takes about 13 minutes per tower.
+Starting at 22:00 means the result is on disk before `report_and_retain.py` fires,
+so the build appears in **that night's** report. Set `NB_BUILD_HOUR` to `23` and
+the build finishes after the rollover, so it lands in tomorrow's report instead.
+Both work; only one puts the build and the day it belongs to in the same
+document.
+
+Measured cost: two towers build in parallel, ~13 minutes each, so roughly 780
+Actions minutes a month against a 2,000-minute private-repo allowance — and
+nights where nothing was committed cost nothing at all.
 
 ## Why those secrets are mandatory
 
@@ -136,11 +142,20 @@ topic and wrong mechanical constants.
 
 ### 2. The firmware repo
 
-Copy [`firmware-repo-hook/nightly-dispatch.yml`](firmware-repo-hook/nightly-dispatch.yml)
-to `.github/workflows/nightly-dispatch.yml` there, and add a secret
-`NIGHTLY_DISPATCH_TOKEN` (fine-grained PAT with `Actions: read/write` on
-`JPI-US/nightly-built`). While `Janta_Power` is public the dispatch still needs that secret, since it writes to another repo. That is all the firmware repo needs to know — every
-build decision stays here.
+Nothing. `Janta_Power` needs no workflow, no secret, and no awareness that any
+of this exists — the nightly resolves its branch head with `git ls-remote` and
+decides for itself.
+
+**There is deliberately no push trigger.** A commit landing at 3pm and one
+landing at 9pm produce the same nightly build, so reacting to each push spends
+Actions minutes on work the 10pm run does anyway. Instead the gate compares the
+branch head against a cache entry keyed by that commit: unchanged since the last
+green build, and the run stops in about two seconds having spent nothing.
+
+The marker is only written when the **whole matrix** passes, so a night where
+one tower fails leaves no marker and tomorrow retries rather than skipping a
+broken commit forever. `workflow_dispatch` with **force** overrides the check
+when you want to rebuild the same commit anyway.
 
 ### 3. The Monitor PC
 
