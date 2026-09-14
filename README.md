@@ -118,9 +118,11 @@ holding a fourth secret. `DEVICE_ID` is parsed back out of `FIRMWARE_DOTENV`, so
 the cert filenames can't drift from the `.env`.
 
 **The image is therefore device-specific** — it embeds one tower's credentials and
-constants. `manifest.json` records `device_id` so the installer can refuse to flash
-it to the wrong tower. Building for the fleet means a matrix over `DEVICE_ID`, which
-this workflow does not yet do.
+constants, which is why the workflow runs a matrix over `DEVICE_ID` rather than
+building once. `manifest.json` records `device_id`, and `build_agent.py` will only
+accept the artifact whose name ends in its own `NB_DEVICE_ID` — it skips rather than
+falling back, because flashing the wrong tower's image means wrong certs, wrong MQTT
+topic and wrong mechanical constants.
 
 > ### Make this repo private before adding the cert secrets
 >
