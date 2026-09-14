@@ -41,7 +41,11 @@ def load_dotenv(path=None):
                 val = val.strip().strip('"').strip("'")
                 if key and key not in os.environ:
                     os.environ[key] = val
-        except FileNotFoundError:
+        except OSError:
+            # Not just FileNotFoundError: on Windows a path on a drive that
+            # exists but isn't readable raises PermissionError, and on the Pi
+            # a root-owned .env raises the same. Importing this module must
+            # never be what takes the agent down.
             continue
 
 
@@ -68,6 +72,24 @@ GH_TOKEN  = os.environ.get("NB_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") 
 GH_WORKFLOW = os.environ.get("NB_WORKFLOW_FILE", "nightly-build.yml")
 POLL_SECS = int(os.environ.get("NB_POLL_SECS", "180"))
 
+# Which tower this machine is watching. Set it once both towers are running,
+# so the two agents can share one reports directory without overwriting each
+# other. Left empty the filenames stay exactly as they are today - which keeps
+# a single-tower install working unchanged.
+DEVICE_ID = os.environ.get("NB_DEVICE_ID", "").strip()
+
+
+def scoped(stem):
+    """Insert the device id into a filename stem, when one is configured.
+
+    'build' -> 'build-tower5' with NB_DEVICE_ID=tower5, or 'build' unchanged
+    without it. Applied to every file this repo writes into the shared reports
+    directory, so two machines publishing to one folder can't clobber each
+    other - and a single-tower install keeps exactly the filenames it has now.
+    """
+    return f"{stem}-{DEVICE_ID}" if DEVICE_ID else stem
+
+
 # Serial / flashing
 CHIP            = os.environ.get("NB_CHIP", "esp32s3")
 CONTROL_HOST    = os.environ.get("NB_CONTROL_HOST", "127.0.0.1")
@@ -77,9 +99,9 @@ AUTO_FLASH      = os.environ.get("NB_AUTO_FLASH", "0") not in ("0", "false", "no
 
 # Published status files the React app can read over the same LAN mount as the
 # reports (mirrors capture-status.json).
-BUILD_STATUS_PATH   = os.path.join(REPORTS_DIR, "build-status.json")
-CAPTURE_STATUS_PATH = os.path.join(REPORTS_DIR, "capture-status.json")
-FAILED_MARKER       = os.path.join(REPORTS_DIR, "BUILD-FAILED.txt")
+BUILD_STATUS_PATH   = os.path.join(REPORTS_DIR, f"{scoped('build-status')}.json")
+CAPTURE_STATUS_PATH = os.path.join(REPORTS_DIR, f"{scoped('capture-status')}.json")
+FAILED_MARKER       = os.path.join(REPORTS_DIR, f"{scoped('BUILD-FAILED')}.txt")
 
 ROLLOVER_HOUR   = int(os.environ.get("NB_ROLLOVER_HOUR", "23"))
 MIN_SLICE_LINES = int(os.environ.get("NB_MIN_SLICE_LINES", "50"))
@@ -147,15 +169,26 @@ def sha256_file(path):
 
 # ------------------------------------------------------------ notification --
 def notify(title, message, level="warning"):
-    """Best-effort desktop notification + console bell + a marker file.
+    """Best-effort notification + console bell. Never raises.
 
-    Never raises: a failed toast must not take down the build agent.
+    Windows gets a toast. A headless Pi has no desktop session to toast *to*,
+    so there the message goes to journald (systemd captures stdout) and, when
+    something did set up a session, notify-send as well. Either way the caller
+    has already written the marker file, which is the durable channel.
     """
     sys.stdout.write("\a")
     sys.stdout.flush()
     log("notify", f"{title}: {message}")
-    if os.name != "nt":
-        return
+    try:
+        if os.name == "nt":
+            _notify_windows(title, message, level)
+        else:
+            _notify_posix(title, message, level)
+    except Exception as exc:      # noqa: BLE001 - notification is never fatal
+        log("notify", f"notification failed ({exc})")
+
+
+def _notify_windows(title, message, level):
     icon = {"error": "Error", "warning": "Warning", "info": "Info"}.get(level, "Info")
     # NotifyIcon balloon: no external module, and Windows 11 renders it as a
     # normal toast. The sleep is required - disposing immediately kills it.
@@ -169,14 +202,30 @@ def notify(title, message, level="warning"):
         f" [System.Windows.Forms.ToolTipIcon]::{icon});"
         "Start-Sleep -Seconds 8; $n.Dispose()"
     )
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def _notify_posix(title, message, level):
+    priority = {"error": "user.err", "warning": "user.warning"}.get(level, "user.notice")
+    # logger tags the message so `journalctl -t axum-nightly` finds every
+    # notification even when the agent was started by hand rather than systemd.
+    _run_quiet(["logger", "-t", "axum-nightly", "-p", priority, f"{title}: {message}"])
+    # Only meaningful on a Pi someone plugged a monitor into; harmless otherwise.
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        urgency = "critical" if level == "error" else "normal"
+        _run_quiet(["notify-send", "-u", urgency, title, message])
+
+
+def _run_quiet(args):
+    """Fire and forget; a missing binary is not an error worth reporting."""
     try:
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except Exception as exc:      # noqa: BLE001 - notification is never fatal
-        log("notify", f"toast failed ({exc})")
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, ValueError):
+        pass
 
 
 def _ps_quote(s):

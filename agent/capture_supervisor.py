@@ -285,7 +285,7 @@ class Supervisor:
         self.last_flash = {k: record[k] for k in ("ok", "label", "image", "at")}
         nb.atomic_write_json(os.path.join(nb.STATE_DIR, "last-flash.json"), self.last_flash)
         nb.atomic_write_json(
-            os.path.join(nb.REPORTS_DIR, f"flash-{nb.today_stamp()}.json"), record)
+            os.path.join(nb.REPORTS_DIR, f"{nb.scoped('flash')}-{nb.today_stamp()}.json"), record)
         if not ok:
             nb.notify("Axum flash FAILED", f"{label}: espflash exited {code}", "error")
         return record

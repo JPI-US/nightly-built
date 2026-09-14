@@ -1,0 +1,45 @@
+# Continuous serial capture + flash-on-request for one tower.
+#
+# Install (as the user that owns /opt/scheduler, e.g. mudit):
+#   sudo cp axum-*.service /etc/systemd/system/
+#   sudo sed -i "s/%USER%/$USER/" /etc/systemd/system/axum-*.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now axum-capture
+#
+# Watch it:  journalctl -u axum-capture -f
+[Unit]
+Description=Axum capture supervisor
+Documentation=https://github.com/JPI-US/nightly-built
+# The serial device is a stable /dev/serial/by-id path, not ttyACM0 - see the
+# AXUM_PORT line in /opt/scheduler/.env. No After=dev-... here on purpose: the
+# supervisor's own reattach loop handles a board that is absent or resetting,
+# so a device that is unplugged at boot must not stop the unit from starting.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%USER%
+Group=%USER%
+WorkingDirectory=/opt/scheduler/agent
+EnvironmentFile=/opt/scheduler/.env
+ExecStart=/usr/bin/python3 /opt/scheduler/agent/capture_supervisor.py
+
+# Capture is the thing that must never be down. Restart unconditionally, and
+# don't let the default start-limit give up after a few fast failures - a board
+# that is briefly missing should not take capture down until a human notices.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+# Unbuffered, so journalctl shows lines as they are captured rather than in
+# 8 KB bursts.
+Environment=PYTHONUNBUFFERED=1
+
+# SIGINT, because the supervisor's KeyboardInterrupt handler is what closes the
+# day's slice cleanly and publishes state=stopped.
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

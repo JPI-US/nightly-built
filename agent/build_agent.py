@@ -80,6 +80,18 @@ def download_artifact(run_id, dest_dir):
     if not arts:
         nb.log("build-agent", f"run {run_id} has no build artifact (expired?)")
         return None
+
+    if nb.DEVICE_ID:
+        # With a build matrix the run carries one artifact per tower, named
+        # axum-build-<sha>-<device>. Take ONLY this machine's. Falling back to
+        # arts[0] here would flash another tower's firmware - wrong certs,
+        # wrong MQTT topic, wrong mechanical constants - so this is fatal.
+        mine = [a for a in arts if a["name"].endswith(f"-{nb.DEVICE_ID}")]
+        if not mine:
+            nb.log("build-agent", f"run {run_id} has no artifact for {nb.DEVICE_ID} "
+                                  f"(saw: {', '.join(a['name'] for a in arts)}) - skipping.")
+            return None
+        arts = mine
     art = arts[0]
     status, blob = nb.gh_request(art["archive_download_url"], raw=True)
     if status != 200 or not isinstance(blob, (bytes, bytearray)):
@@ -171,8 +183,9 @@ def publish(manifest, run, extract_dir):
         "seen_at": nb.now_iso(),
         "artifact_dir": extract_dir,
     })
-    nb.atomic_write_json(os.path.join(nb.REPORTS_DIR, f"build-{date}.json"), record)
-    nb.atomic_write(os.path.join(nb.REPORTS_DIR, f"build-{date}.md"),
+    nb.atomic_write_json(
+        os.path.join(nb.REPORTS_DIR, f"{nb.scoped('build')}-{date}.json"), record)
+    nb.atomic_write(os.path.join(nb.REPORTS_DIR, f"{nb.scoped('build')}-{date}.md"),
                     render_markdown(manifest, run, commits, error_excerpt))
     nb.atomic_write_json(nb.BUILD_STATUS_PATH, {
         "verdict": manifest.get("verdict"),

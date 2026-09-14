@@ -1,0 +1,30 @@
+# Watches GitHub for finished nightly builds, promotes the known-good image,
+# publishes build reports, and (with NB_AUTO_FLASH=1) asks axum-capture to
+# flash. See axum-capture.service for install instructions.
+#
+# Watch it:  journalctl -u axum-build-agent -f
+[Unit]
+Description=Axum nightly build agent
+Documentation=https://github.com/JPI-US/nightly-built
+After=network-online.target axum-capture.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%USER%
+Group=%USER%
+WorkingDirectory=/opt/scheduler/agent
+EnvironmentFile=/opt/scheduler/.env
+ExecStart=/usr/bin/python3 /opt/scheduler/agent/build_agent.py
+
+# Less critical than capture - a missed poll costs minutes, not data - but it
+# should still come back on its own after a network blip or an API hiccup.
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=0
+
+Environment=PYTHONUNBUFFERED=1
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

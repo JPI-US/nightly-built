@@ -142,7 +142,7 @@ def main(artifact_dir):
               f"{manifest.get('commit_subject','')} "
               f"({manifest.get('commit_author','?')})  \n"
               f"{manifest.get('run_url','')}\n\n---\n\n")
-    out = os.path.join(nb.REPORTS_DIR, f"build_report_{date}.md")
+    out = os.path.join(nb.REPORTS_DIR, f"{nb.scoped('build_report')}-{date}.md")
     nb.atomic_write(out, header + answer.strip() + "\n")
     print(f"[analyze] wrote {out}")
     return 0
