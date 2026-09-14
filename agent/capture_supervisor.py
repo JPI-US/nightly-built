@@ -508,7 +508,11 @@ class Supervisor:
                         # resets in the process's whole lifetime would disable
                         # auto-reset forever.
                         self.resets_this_attach = 0
-                    print(line)          # echo so capture is visibly live
+                    # nb.EOL rather than a bare newline: espflash holds the
+                    # terminal in raw mode, so a linefeed on its own would
+                    # staircase this echo down the screen instead of returning
+                    # to column 0.
+                    print(line, end=nb.EOL)   # echo so capture is visibly live
                 self.proc.wait()
                 self.proc = None
 
@@ -542,6 +546,13 @@ class Supervisor:
             except Exception:      # noqa: BLE001
                 pass
         self.publish_status("stopped")
+        # espflash left the tty in raw mode if we killed it rather than letting
+        # it exit; without this the user's shell is unusable afterwards.
+        if sys.stdout.isatty():
+            try:
+                subprocess.run(["stty", "sane"], check=False)
+            except OSError:
+                pass
         nb.log("supervisor", "stopped.")
 
 

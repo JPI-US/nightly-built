@@ -115,8 +115,16 @@ def today_stamp(dt=None):
     return (dt or datetime.datetime.now()).strftime("%Y%m%d")
 
 
+# `espflash monitor` puts the controlling terminal into raw mode so it can catch
+# Ctrl+R, which disables the tty's usual \n -> \r\n translation. Anything we
+# print alongside it then staircases down the screen instead of starting at
+# column 0. Emit the carriage return ourselves when stdout is a terminal; under
+# systemd (journald) stdout is a pipe and plain \n is correct.
+EOL = "\r\n" if sys.stdout.isatty() else "\n"
+
+
 def log(tag, msg):
-    print(f"[{tag}] {msg}", flush=True)
+    print(f"[{tag}] {msg}", end=EOL, flush=True)
 
 
 # --------------------------------------------------------------- io helpers -
