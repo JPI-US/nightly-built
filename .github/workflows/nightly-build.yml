@@ -31,6 +31,11 @@ env:
   TARGET:          ${{ vars.NB_RUST_TARGET || 'xtensa-esp32s3-espidf' }}
   PROFILE:         ${{ vars.NB_CARGO_PROFILE || 'release' }}
   BIN_NAME:        ${{ vars.NB_BIN_NAME || 'tower' }}
+  # partitions.csv runs to exactly 0x800000, and app1/littlefs/coredump all sit
+  # beyond 4MB. With no chip attached espflash can't detect flash size and falls
+  # back to its default, so this has to be stated explicitly or the packaged
+  # image is wrong. Note the chip itself is 32MB - the table just doesn't use it.
+  FLASH_SIZE:      ${{ vars.NB_FLASH_SIZE || '8mb' }}
 
 jobs:
   # --------------------------------------------------------------------------
@@ -234,8 +239,15 @@ jobs:
           # espflash's default layout instead of the tower's.
           # If a future esp-idf-sys drops the ESP-IDF app descriptor, add
           # --ignore-app-descriptor here rather than downgrading espflash.
-          espflash save-image --chip "$CHIP" --partition-table partitions.csv --merge "$elf" "$outdir/$name-merged.bin"
-          espflash save-image --chip "$CHIP" --partition-table partitions.csv "$elf" "$outdir/$name-app.bin"
+          # --skip-padding keeps the merged blob at roughly the end of the app
+          # (~2.2MB) instead of padding out to the full 8MB of mostly 0xFF.
+          # Inter-segment gaps are still padded, so offsets stay correct and it
+          # is still written at 0x0.
+          espflash save-image --chip "$CHIP" --flash-size "$FLASH_SIZE" \
+            --partition-table partitions.csv --merge --skip-padding \
+            "$elf" "$outdir/$name-merged.bin"
+          espflash save-image --chip "$CHIP" --flash-size "$FLASH_SIZE" \
+            --partition-table partitions.csv "$elf" "$outdir/$name-app.bin"
           ( cd "$outdir" && sha256sum ./* > SHA256SUMS )
           echo "name=$name" >> "$GITHUB_OUTPUT"
           ls -l "$outdir"
@@ -290,6 +302,10 @@ jobs:
               "image":          os.environ["IMAGE"],
               "image_sha256":   os.environ["IMAGE_SHA"],
               "flash_offset":   "0x0",
+              # The installer needs both: write at 0x0, and the chip must be
+              # configured for this flash size or the partition table won't fit.
+              "flash_size":     os.environ.get("FLASH_SIZE", ""),
+              "partition_table": "partitions.csv",
               # The image embeds THIS tower's certs and .env constants - it is
               # not interchangeable across the fleet.
               "device_id":      os.environ.get("DEVICE_ID", ""),
