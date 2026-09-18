@@ -157,26 +157,38 @@ one tower fails leaves no marker and tomorrow retries rather than skipping a
 broken commit forever. `workflow_dispatch` with **force** overrides the check
 when you want to rebuild the same commit anyway.
 
-### 3. The Monitor PC
+### 3. The capture nodes
 
-Copy `agent/` to `D:\scheduler\agent\` and add to the existing `D:\scheduler\.env`:
+**One Raspberry Pi per tower** — 9001 and 9000 — both on Pi OS Lite 64-bit. The
+Windows desktop is deliberately not in the data path: it's a machine people use,
+and people close laptops and install updates.
 
-```ini
-NB_GITHUB_TOKEN=ghp_...        # Actions: read  on JPI-US/nightly-built
-NB_GITHUB_REPO=JPI-US/nightly-built
-NB_AUTO_FLASH=0                # 1 = flash every green build automatically
-NB_ERASE_FLASH=1               # erase-flash before writing (see the NVS note)
+On a fresh Pi, after Tailscale is up and the repo is cloned via a deploy key:
+
+```bash
+/opt/scheduler/nightly-built/agent/provision-pi.sh 9000
 ```
 
-`AXUM_PORT`, `AXUM_LOG_DIR`, `AXUM_REPORTS_DIR`, `ANTHROPIC_API_KEY` are read from
-that same file — the agent deliberately shares one `.env` with `process_log.py`.
+That does packages, `dialout`, the Wi-Fi power-save drop-in, disabling unattended
+reboots, keeping cargo off tmpfs, espflash, the directory layout, the report
+pipeline from `data-processor-scheduler`, serial-port detection, and a first-cut
+`.env`. It's idempotent, and it stops short of anything needing a human — the
+Tailscale auth URL, the two API credentials, and installing the services — which
+it prints at the end.
 
-Then run the two long-lived processes (`start-supervisor.cmd`, `start-build-agent.cmd`):
+Then fill in the two secrets and start it:
 
+```bash
+nano /opt/scheduler/.env          # NB_GITHUB_TOKEN, ANTHROPIC_API_KEY
+sudo cp agent/systemd/axum-*.service /etc/systemd/system/
+sudo sed -i "s/%USER%/$USER/" /etc/systemd/system/axum-*.service
+sudo systemctl daemon-reload && sudo systemctl enable --now axum-capture
+journalctl -u axum-capture -f
 ```
-python capture_supervisor.py     # replaces capture_daemon.py
-python build_agent.py            # watches GitHub
-```
+
+The two nodes differ in exactly two values — `NB_DEVICE_ID` and `AXUM_PORT` (each
+board's `by-id` path embeds its own MAC). Everything else is identical, which is
+the point: one runbook, one set of units, no platform branch.
 
 ---
 
