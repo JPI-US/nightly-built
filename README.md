@@ -8,7 +8,7 @@ Two halves:
 | Half | Runs on | Job |
 | --- | --- | --- |
 | **`.github/workflows/nightly-build.yml`** | GitHub-hosted runner | fresh pull → `esp clean` → `cargo clean` → `cargo build` → flashable image |
-| **`agent/`** | the Monitor PC (`D:\scheduler`) | watch for results, keep the last good image, flash it, publish into the reports the 11 PM analysis reads |
+| **`agent/`** | one Raspberry Pi per tower (`/opt/scheduler`) | watch for results, keep the last good image, flash it, publish into the reports the 11 PM analysis reads |
 
 ```
 22:00 local, if `deployment` has moved ──► GitHub Actions ──► artifact per tower
